@@ -1,0 +1,185 @@
+Introduction
+Artificial intelligence has moved well beyond the era of chatbots that simply answer questions. The frontier today is agentic AI — systems that receive a goal, reason about what needs to be done, call external tools autonomously, and complete multi-step tasks without hand-holding.
+
+I recently built a production-grade multi-agent system from scratch using Model Context Protocol (MCP), FastMCP, and OpenAI's o4-mini reasoning model. In this article I want to walk through the full journey: what MCP is and why it matters, how the system is architected, how the two specialist agents are designed, the beauty of LLM-driven natural language tool selection, a real-world cross-agent workflow, and the critical lessons I learned about keeping agents on the rails.
+
+The source code is open on GitHub. This article is about the thinking behind it.
+
+
+What Is Model Context Protocol — And Why Does It Matter?
+Before MCP, integrating an AI model with an external system required custom glue code for every combination of model and tool. Claude needed one connector for your database, another for Slack, another for your file system — and every other AI model needed the same connectors built separately. It was an N×M integration problem that did not scale.
+
+Model Context Protocol is an open standard introduced by Anthropic in November 2024 and now adopted by OpenAI, Google DeepMind, and Microsoft. Think of it as USB-C for AI — a single universal connector between language models and the outside world.
+
+The protocol defines a client-server architecture built on JSON-RPC 2.0. An MCP server exposes capabilities — tools (functions the AI can call), resources (data it can read), and prompts (templates). An MCP client connects to one or more servers, discovers what is available, and routes the model's requests to the right place. Communication happens over stdio (for local subprocess servers) or Streamable HTTP (for remote servers).
+
+The elegant result: build one MCP server for your database, and every MCP-compatible AI client — Claude, your custom agent, Cursor, GitHub Copilot — can use it immediately. 
+
+
+The System Architecture: Orchestrator Pattern
+For this project I chose the orchestrator pattern — the most scalable approach for multi-agent systems.
+
+Rather than building one large agent that knows everything, the system is divided into three distinct layers:
+
+User types a task
+        |
+        v
+  Orchestrator  (OpenAI o4-mini)
+  ├── decides which specialist(s) to delegate to
+  ├── calls delegate_to_agent(agent_name, sub_task)
+  |
+  |---> LocalAgent ---------> server/server.py  (FastMCP, stdio)
+  |          9 tools: files, directories, SQLite database
+  |
+  └---> OpenMeteoAgent -----> npx open-meteo-mcp-server  (stdio, no API key)
+             6 tools: weather forecast, archive, air quality, marine, elevation, geocoding
+
+The orchestrator receives the user's plain-English task. It has exactly one tool: delegate_to_agent(agent_name, sub_task). It never touches files, databases, or weather APIs directly. Its only job is to reason about the task, decide which specialist is responsible, and delegate with a clear sub-task string that contains all the context the specialist needs.
+
+The LocalAgent is a specialist that connects to a local FastMCP server written in Python. This server exposes 9 tools covering all filesystem and database operations.
+
+The OpenMeteoAgent is a specialist that connects to open-meteo-mcp-server — an npm package that runs via npx with zero credentials. It wraps Open-Meteo's free public weather API, exposing 6 tools for forecasts, historical weather, air quality, marine conditions, elevation, and geocoding.
+
+This separation of concerns is intentional and fundamental. Each agent is a domain expert. It knows its tools deeply and is instructed to use only those tools. The orchestrator is a coordinator — it knows which expert to call but does not do any domain work itself.
+
+
+Building the Local MCP Server with FastMCP
+The local server is built using FastMCP — the high-level server framework that ships inside the official MCP Python SDK. Its key advantage is that it eliminates boilerplate entirely. Instead of manually writing JSON schemas, routing logic, and transport handling, you simply decorate Python functions:
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("local-fs-db-server")
+
+@mcp.tool()
+def db_write(key: str, value: str) -> str:
+    """Insert or update a key-value note in the SQLite database.
+    Uses UPSERT — if the key exists, its value is updated, not duplicated.
+
+    Args:
+        key:   Unique note key / label
+        value: Note value / content
+    """
+    # implementation
+    ...
+
+FastMCP reads the function signature, generates the JSON schema from type hints, and uses the docstring as the tool description that the LLM reads when deciding what to call. The description is not just documentation — it is the primary signal the model uses to select the right tool. This is a critical design point I will return to shortly.
+
+The server exposes 9 idempotent tools. Every tool is safe to call multiple times. db_write uses INSERT ... ON CONFLICT(key) DO UPDATE so running the agent repeatedly never creates duplicate rows. Directories use exist_ok=True. Files always overwrite. This idempotency is deliberate — agents will retry, and the system must be resilient to that.
+
+The server runs as a subprocess of the agent. When the agent starts, it spawns server.py via StdioServerParameters, communicates over stdin/stdout using JSON-RPC 2.0, and kills the subprocess when done. The server is never run manually.
+
+
+The OpenMeteo Agent: External MCP with Zero Credentials
+The OpenMeteoAgent connects to an external, community-built MCP server that requires no API key, no account, and no installation beyond Node.js. It runs entirely via:
+
+StdioServerParameters(
+    command="npx",
+    args=["-y", "open-meteo-mcp-server"],
+)
+
+This is what the MCP ecosystem looks like in practice. A community developer has packaged Open-Meteo's comprehensive weather API as an MCP server, published it to npm, and anyone can connect to it with three lines of configuration. The agent discovers the available tools at runtime by calling session.list_tools() — it does not need to know anything about the server implementation in advance.
+
+The six tools cover a wide surface: weather_forecast for 7-day hourly and daily forecasts, weather_archive for historical data going back to 1940, air_quality for PM2.5, PM10, UV index, and pollen levels, marine_weather for wave conditions, elevation for altitude data, and geocoding for converting city names to coordinates.
+
+
+The Beauty of LLM-Driven Natural Language Tool Selection
+This is where the system becomes genuinely remarkable.
+
+No part of the code decides which tool to call. No if task contains "weather" then use openmeteo. The entire tool selection process is driven by the language model's natural language understanding.
+
+Here is exactly how it works:
+
+When the orchestrator receives a task, it sends the task text along with a description of each available agent to o4-mini. The model reads them, reasons about what the task requires, and responds with a structured delegate_to_agent call specifying which agent and what sub-task to give it.
+
+Inside the specialist agent, the same process repeats at the tool level. The agent sends the task it received along with the full list of MCP tools — names, descriptions, and parameter schemas — to the LLM. The model decides which tool to call, what arguments to pass, and whether to call more tools or return a final answer.
+
+The LLM infers multi-step plans entirely from tool descriptions. Given the sub-task "get coordinates for Mumbai then fetch a 3-day weather forecast", the model recognises that geocoding must be called first to get latitude and longitude, then those coordinates must be passed to weather_forecast. Nobody wrote this logic. It emerges from the model's understanding of the tool descriptions and the natural dependencies between them.
+
+
+A Real Cross-Agent Workflow: Weather Data to Local Database
+Let me walk through a concrete end-to-end example that shows both agents working together.
+
+User input: "Get the 3-day weather forecast for Mumbai and save each day to the local database"
+
+Orchestrator step 1 — The orchestrator recognises this spans two domains: weather retrieval and local storage. It delegates to OpenMeteoAgent first:
+
+Sub-task: "Get coordinates for Mumbai then fetch a 3-day weather forecast with daily temperature highs and lows, precipitation, and humidity."
+
+The OpenMeteoAgent calls geocoding(name="Mumbai") to get the coordinates, then calls weather_forecast with those coordinates and the appropriate parameters. It returns a structured summary of three days of weather data.
+
+Orchestrator step 2 — The orchestrator receives the weather data and delegates to LocalAgent, passing the actual data inline:
+
+Sub-task: "Save these 3 forecast records to the database: day1 key='mumbai_2026-04-06' value='max 34°C min 27°C humidity 72% precipitation 2mm', day2 key='mumbai_2026-04-07' value='max 33°C min 26°C humidity 75% precipitation 5mm', day3 key='mumbai_2026-04-08' value='max 32°C min 26°C humidity 78% precipitation 8mm'"
+
+The LocalAgent calls db_write three times with unique date-based keys. Each call uses UPSERT — running this query again tomorrow will update the records, not duplicate them.
+
+Result: Three rows now live in a local SQLite database. Later, the user can ask "read the Mumbai forecast from the database" — LocalAgent calls db_read, retrieves all three rows, and presents them in a readable format.
+
+No Python scripts. No SQL written by hand. No shell commands. The LLM understood the intent, selected the right tools in the right sequence, and coordinated data transfer between two completely separate agents — all from a single sentence of plain English.
+
+
+A Critical Lesson: Tool-Only Enforcement Through System Prompts
+During development I encountered a fundamental failure mode that taught me the most important lesson of this project.
+
+When the LocalAgent was asked to "save weather data to the database", it occasionally responded by generating a Python script using sqlite3 directly, then suggesting the user run it manually. The LLM defaulted to what it knows best — writing code — rather than using the MCP tools it had been given.
+
+The fix was not in the code. It was in the system prompts.
+
+I added explicit, prohibitive rules to both the agent and orchestrator prompts:
+
+For the LocalAgent:
+
+"You ONLY use the tools listed above. You never write Python scripts, shell commands, SQL statements, or any code as your response. You NEVER suggest the user run a script or command. You execute actions directly."
+
+For the orchestrator:
+
+"Agents ONLY execute actions using their MCP tools. They do NOT write scripts or code. When you delegate to the local agent to save data, say 'save this to the database' and pass the actual data. Do NOT ask it to 'create a script'."
+
+This is the most important architectural lesson: the system prompt is your primary control mechanism. Positive guidance alone is not enough. You need explicit prohibitions against the failure modes you have observed. Vague prompts produce creative but wrong behaviour. Precise, specific, prohibitive prompts produce reliable, predictable tool use.
+
+The same principle applies to tool descriptions on the server side. The LLM selects tools based entirely on their names and descriptions. A vague description like "saves data" will cause the model to misuse the tool or skip it. A specific description like "Insert or update a key-value note using UPSERT — safe to call multiple times" gives the model exactly what it needs to make the right decision.
+
+
+The Tech Stack
+Python 3.12 — core language
+
+mcp >= 1.0.0 — official Anthropic MCP Python SDK
+
+FastMCP — high-level @mcp.tool() decorator framework, ships inside mcp
+
+OpenAI SDK — typed ChatCompletionToolParam, ChatCompletionMessageToolCall, full type safety
+
+OpenAI o4-mini — reasoning model for orchestrator and all specialist agents
+
+open-meteo-mcp-server — npm package, runs via npx, no credentials required
+
+SQLite — built into Python stdlib, no external database server
+
+Docker + docker-compose — containerised deployment
+
+The MCP client uses the low-level SDK (ClientSession + StdioServerParameters) rather than a high-level wrapper, which provides full type safety, clean error handling, and precise control over the session lifecycle.
+
+
+Extensibility: Adding a New Agent in Two Steps
+The architecture is designed to grow. Adding a third specialist — a GitHub agent, a Slack agent, a database agent for PostgreSQL — requires exactly two changes:
+
+Step 1: Create agents/github_agent.py extending BaseAgent, set server_params to point at the MCP server package.
+
+Step 2: Register it in orchestrator.py with a one-line description.
+
+The orchestrator automatically includes the new agent in the LLM's decision context. No changes to existing agents. No changes to BaseAgent. No changes to the session management. The system self-extends.
+
+This is the promise of MCP at scale. The growing ecosystem of community-built MCP servers — covering GitHub, Slack, Notion, Jira, PostgreSQL, Stripe, and hundreds more — becomes a library of plug-and-play capabilities any agent can connect to with a few lines of configuration.
+
+
+Conclusion
+Building this system reinforced something I believe deeply: the hard part of multi-agent AI is not the code. The hard part is the design of responsibilities, the clarity of tool descriptions, and the precision of system prompts.
+
+Get those right and the LLM does exactly what you intend — selecting the right tools in the right sequence, coordinating across agents, and handling complex multi-step tasks from plain English input with no hardcoded logic anywhere in the pipeline.
+
+Get them wrong and you will spend your time chasing hallucinated scripts and misrouted delegations.
+
+The source code is available on GitHub at github.com/asimansubera/mcp-agent. I am happy to discuss the architecture, design decisions, or lessons learned in the comments.
+
+
+Tags: #ModelContextProtocol #MCP #AIAgents #MultiAgent #FastMCP #OpenAI #Python #SoftwareArchitecture #GenerativeAI #LLM #ArtificialIntelligence #BuildInPublic
