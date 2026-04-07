@@ -47,7 +47,6 @@
       opacity: .4;
     }
 
-    /* ── nav ── */
     nav {
       position: sticky;
       top: 0;
@@ -74,7 +73,6 @@
       letter-spacing: .12em;
       text-decoration: none;
     }
-
     .nav-logo span { color: var(--muted); }
 
     .nav-link {
@@ -87,7 +85,6 @@
     }
     .nav-link:hover { color: var(--accent); }
 
-    /* ── hero ── */
     header {
       position: relative;
       overflow: hidden;
@@ -139,7 +136,6 @@
       animation: fadeUp .6s .16s ease both;
     }
 
-    /* ── stats bar ── */
     .stats {
       display: flex;
       gap: 2.5rem;
@@ -148,11 +144,7 @@
       animation: fadeUp .6s .24s ease both;
     }
 
-    .stat-item {
-      display: flex;
-      flex-direction: column;
-      gap: .15rem;
-    }
+    .stat-item { display: flex; flex-direction: column; gap: .15rem; }
 
     .stat-num {
       font-family: 'DM Serif Display', serif;
@@ -169,7 +161,6 @@
       color: var(--muted);
     }
 
-    /* ── filter bar ── */
     .filter-bar {
       display: flex;
       align-items: center;
@@ -209,7 +200,6 @@
       border-color: rgba(0,212,170,.3);
     }
 
-    /* ── article grid ── */
     .articles { display: flex; flex-direction: column; gap: 1.2rem; padding-bottom: 5rem; }
 
     .article-card {
@@ -235,6 +225,9 @@
       transition: transform .25s;
       transform-origin: bottom;
     }
+
+    .article-card.blue-accent::before { background: var(--accent2); }
+    .article-card.blue-accent:hover   { border-color: rgba(59,130,246,.3); }
 
     .article-card:hover {
       border-color: rgba(0,212,170,.3);
@@ -269,10 +262,7 @@
       transition: opacity .2s, transform .2s;
     }
 
-    .article-card:hover .card-arrow {
-      opacity: 1;
-      transform: translateX(0);
-    }
+    .article-card:hover .card-arrow { opacity: 1; transform: translateX(0); }
 
     .card-desc {
       font-size: .9rem;
@@ -315,7 +305,6 @@
       border: 1px solid rgba(77,168,212,.15);
     }
 
-    /* ── coming soon card ── */
     .article-card.coming-soon {
       opacity: .45;
       cursor: default;
@@ -336,7 +325,6 @@
       vertical-align: middle;
     }
 
-    /* ── footer ── */
     footer {
       border-top: 1px solid var(--border);
       padding: 2rem;
@@ -354,18 +342,8 @@
       gap: 1rem;
     }
 
-    .footer-logo {
-      font-family: 'DM Mono', monospace;
-      font-size: .78rem;
-      color: var(--accent);
-      letter-spacing: .1em;
-    }
-
-    .footer-note {
-      font-size: .78rem;
-      color: var(--muted);
-    }
-
+    .footer-logo { font-family: 'DM Mono', monospace; font-size: .78rem; color: var(--accent); letter-spacing: .1em; }
+    .footer-note { font-size: .78rem; color: var(--muted); }
     footer a { color: var(--accent2); text-decoration: none; }
     footer a:hover { text-decoration: underline; }
 
@@ -399,7 +377,7 @@
     <p class="hero-desc">Deep dives on database engineering, AI infrastructure, and data platforms — written from the trenches.</p>
     <div class="stats">
       <div class="stat-item">
-        <span class="stat-num" id="article-count">1</span>
+        <span class="stat-num">2</span><!-- updated from 1 -->
         <span class="stat-label">Articles</span>
       </div>
       <div class="stat-item">
@@ -415,6 +393,7 @@
   <div class="filter-bar reveal">
     <span class="filter-label">Filter</span>
     <button class="filter-btn active" data-tag="all">All</button>
+    <button class="filter-btn" data-tag="agents">Agents</button><!-- new -->
     <button class="filter-btn" data-tag="vector-db">Vector DB</button>
     <button class="filter-btn" data-tag="ai">AI / RAG</button>
     <button class="filter-btn" data-tag="rdbms">RDBMS</button>
@@ -422,8 +401,27 @@
 
   <div class="articles" id="article-list">
 
-    <!-- Article 1 -->
-    <a class="article-card reveal" href="articles/hnsw-vector-indexing.html" data-tags="vector-db ai" style="animation-delay:.05s">
+    <!-- Article 2 — MCP Agent (newest first) -->
+    <a class="article-card blue-accent reveal" href="articles/mcp-agent.html" data-tags="agents ai" style="animation-delay:.05s">
+      <div class="card-top">
+        <div class="card-title">Building a Production Multi-Agent System with MCP</div>
+        <div class="card-arrow">→</div>
+      </div>
+      <p class="card-desc">Orchestrator pattern, FastMCP, LLM-driven tool selection, and the critical lessons learned keeping agents on the rails — built with Model Context Protocol and OpenAI o4-mini.</p>
+      <div class="card-meta">
+        <span class="card-meta-item">🕐 15 min read</span>
+        <span class="card-meta-item">📅 2025</span>
+        <div class="card-tags">
+          <span class="tag">MCP</span>
+          <span class="tag">Agents</span>
+          <span class="tag">FastMCP</span>
+          <span class="tag">OpenAI</span>
+        </div>
+      </div>
+    </a>
+
+    <!-- Article 1 — HNSW -->
+    <a class="article-card reveal" href="articles/hnsw-vector-indexing.html" data-tags="vector-db ai" style="animation-delay:.1s">
       <div class="card-top">
         <div class="card-title">Indexing in the Age of Vectors — HNSW, Quantization &amp; RAG</div>
         <div class="card-arrow">→</div>
@@ -441,8 +439,8 @@
       </div>
     </a>
 
-    <!-- Placeholder 2 -->
-    <div class="article-card coming-soon reveal" style="animation-delay:.1s">
+    <!-- Placeholder -->
+    <div class="article-card coming-soon reveal" style="animation-delay:.15s">
       <div class="card-top">
         <div class="card-title">Next Article <span class="coming-badge">Coming Soon</span></div>
       </div>
