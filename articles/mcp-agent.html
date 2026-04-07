@@ -1,185 +1,742 @@
-Introduction
-Artificial intelligence has moved well beyond the era of chatbots that simply answer questions. The frontier today is agentic AI — systems that receive a goal, reason about what needs to be done, call external tools autonomously, and complete multi-step tasks without hand-holding.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Building a Production Multi-Agent System with MCP</title>
+  <meta name="description" content="How I built a production-grade multi-agent system from scratch using Model Context Protocol, FastMCP, and OpenAI o4-mini." />
+  <meta property="og:title" content="Building a Production Multi-Agent System with MCP" />
+  <meta property="og:type" content="article" />
 
-I recently built a production-grade multi-agent system from scratch using Model Context Protocol (MCP), FastMCP, and OpenAI's o4-mini reasoning model. In this article I want to walk through the full journey: what MCP is and why it matters, how the system is architected, how the two specialist agents are designed, the beauty of LLM-driven natural language tool selection, a real-world cross-agent workflow, and the critical lessons I learned about keeping agents on the rails.
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet" />
 
-The source code is open on GitHub. This article is about the thinking behind it.
+  <style>
+    :root {
+      --bg:        #0b0f14;
+      --surface:   #111720;
+      --border:    #1e2a38;
+      --accent:    #00d4aa;
+      --accent2:   #3b82f6;
+      --text:      #d6e4f0;
+      --muted:     #5a7289;
+      --heading:   #eaf4ff;
+      --tag-bg:    #0d1e2e;
+      --tag-color: #4da8d4;
+      --code-bg:   #0d1a26;
+    }
 
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
 
-What Is Model Context Protocol — And Why Does It Matter?
-Before MCP, integrating an AI model with an external system required custom glue code for every combination of model and tool. Claude needed one connector for your database, another for Slack, another for your file system — and every other AI model needed the same connectors built separately. It was an N×M integration problem that did not scale.
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'DM Sans', sans-serif;
+      font-weight: 300;
+      line-height: 1.8;
+      font-size: 1.05rem;
+      -webkit-font-smoothing: antialiased;
+    }
 
-Model Context Protocol is an open standard introduced by Anthropic in November 2024 and now adopted by OpenAI, Google DeepMind, and Microsoft. Think of it as USB-C for AI — a single universal connector between language models and the outside world.
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 0;
+      opacity: .4;
+    }
 
-The protocol defines a client-server architecture built on JSON-RPC 2.0. An MCP server exposes capabilities — tools (functions the AI can call), resources (data it can read), and prompts (templates). An MCP client connects to one or more servers, discovers what is available, and routes the model's requests to the right place. Communication happens over stdio (for local subprocess servers) or Streamable HTTP (for remote servers).
+    /* ── nav ── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(11,15,20,.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+    }
 
-The elegant result: build one MCP server for your database, and every MCP-compatible AI client — Claude, your custom agent, Cursor, GitHub Copilot — can use it immediately. 
+    .nav-inner {
+      max-width: 820px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 56px;
+    }
 
+    .nav-back {
+      font-family: 'DM Mono', monospace;
+      font-size: .75rem;
+      color: var(--muted);
+      text-decoration: none;
+      letter-spacing: .08em;
+      display: flex;
+      align-items: center;
+      gap: .4rem;
+      transition: color .2s;
+    }
+    .nav-back:hover { color: var(--accent); }
 
-The System Architecture: Orchestrator Pattern
-For this project I chose the orchestrator pattern — the most scalable approach for multi-agent systems.
+    .nav-logo {
+      font-family: 'DM Mono', monospace;
+      font-size: .8rem;
+      color: var(--accent);
+      letter-spacing: .12em;
+      text-decoration: none;
+    }
 
-Rather than building one large agent that knows everything, the system is divided into three distinct layers:
+    /* ── hero ── */
+    header {
+      position: relative;
+      overflow: hidden;
+      padding: 7rem 2rem 5rem;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+    }
 
-User types a task
+    header::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 80% 60% at 50% -10%, rgba(59,130,246,.12) 0%, transparent 70%),
+        radial-gradient(ellipse 60% 40% at 10% 110%, rgba(0,212,170,.10) 0%, transparent 60%);
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    header > * { position: relative; z-index: 1; }
+
+    .eyebrow {
+      display: inline-block;
+      font-family: 'DM Mono', monospace;
+      font-size: .72rem;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+      color: var(--accent2);
+      border: 1px solid rgba(59,130,246,.3);
+      padding: .3rem .8rem;
+      border-radius: 2px;
+      margin-bottom: 1.8rem;
+      animation: fadeUp .6s ease both;
+    }
+
+    h1 {
+      font-family: 'DM Serif Display', serif;
+      font-size: clamp(2.2rem, 5vw, 3.8rem);
+      color: var(--heading);
+      line-height: 1.15;
+      max-width: 820px;
+      margin: 0 auto 1.4rem;
+      animation: fadeUp .7s .1s ease both;
+    }
+
+    h1 em { font-style: italic; color: var(--accent2); }
+
+    .subtitle {
+      font-size: 1.1rem;
+      color: var(--muted);
+      max-width: 580px;
+      margin: 0 auto 2.5rem;
+      animation: fadeUp .7s .2s ease both;
+    }
+
+    .meta {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+      animation: fadeUp .7s .3s ease both;
+    }
+
+    .meta-item {
+      font-family: 'DM Mono', monospace;
+      font-size: .75rem;
+      color: var(--muted);
+    }
+
+    /* ── layout ── */
+    .container { max-width: 780px; margin: 0 auto; padding: 0 2rem; position: relative; z-index: 1; }
+
+    article { padding: 4rem 0 6rem; }
+
+    h2 {
+      font-family: 'DM Serif Display', serif;
+      font-size: 1.75rem;
+      color: var(--heading);
+      margin: 3.5rem 0 1rem;
+      padding-bottom: .5rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: .6rem;
+    }
+
+    h2 .num {
+      font-family: 'DM Mono', monospace;
+      font-size: .75rem;
+      color: var(--accent2);
+      border: 1px solid rgba(59,130,246,.3);
+      padding: .15rem .4rem;
+      border-radius: 2px;
+      letter-spacing: .1em;
+    }
+
+    p { margin-bottom: 1.4rem; }
+    strong { color: var(--heading); font-weight: 500; }
+
+    /* ── callouts ── */
+    .callout {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent2);
+      border-radius: 4px;
+      padding: 1.2rem 1.5rem;
+      margin: 2rem 0;
+      font-size: .97rem;
+    }
+    .callout.green { border-left-color: var(--accent); }
+
+    /* ── code blocks ── */
+    code {
+      font-family: 'DM Mono', monospace;
+      font-size: .85em;
+      background: var(--code-bg);
+      color: var(--accent);
+      padding: .1em .35em;
+      border-radius: 3px;
+      border: 1px solid rgba(0,212,170,.15);
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1.4rem 1.6rem;
+      margin: 1.5rem 0 2rem;
+      overflow-x: auto;
+      font-family: 'DM Mono', monospace;
+      font-size: .82rem;
+      line-height: 1.7;
+      color: #a8d4f0;
+    }
+
+    pre .kw  { color: #7dd3fc; }
+    pre .fn  { color: var(--accent); }
+    pre .st  { color: #86efac; }
+    pre .cm  { color: var(--muted); font-style: italic; }
+    pre .dc  { color: #c084fc; }
+
+    /* ── architecture diagram ── */
+    .arch-box {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1.6rem 2rem;
+      margin: 1.5rem 0 2rem;
+      font-family: 'DM Mono', monospace;
+      font-size: .78rem;
+      line-height: 1.9;
+      color: #a8d4f0;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    /* ── layer cards ── */
+    .layer-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+      margin: 1.5rem 0 2rem;
+    }
+
+    .layer-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1.2rem 1rem;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .layer-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 2px;
+    }
+
+    .layer-card.orch::before  { background: var(--accent2); }
+    .layer-card.local::before { background: var(--accent); }
+    .layer-card.wx::before    { background: #f59e0b; }
+
+    .layer-label {
+      font-family: 'DM Mono', monospace;
+      font-size: .62rem;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: .5rem;
+    }
+
+    .layer-title {
+      font-size: .95rem;
+      color: var(--heading);
+      font-weight: 500;
+      margin-bottom: .4rem;
+    }
+
+    .layer-desc {
+      font-size: .78rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .layer-tools {
+      margin-top: .6rem;
+      font-family: 'DM Mono', monospace;
+      font-size: .68rem;
+      color: var(--accent);
+    }
+
+    /* ── flow (reuse from hnsw article) ── */
+    .flow {
+      display: flex;
+      align-items: stretch;
+      margin: 2rem 0;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .flow-step {
+      flex: 1;
+      padding: 1.2rem 1rem;
+      background: var(--surface);
+      text-align: center;
+      position: relative;
+    }
+
+    .flow-step:not(:last-child)::after {
+      content: '→';
+      position: absolute;
+      right: -12px; top: 50%;
+      transform: translateY(-50%);
+      color: var(--accent2);
+      font-size: 1.1rem;
+      z-index: 2;
+    }
+
+    .flow-step:not(:last-child) { border-right: 1px solid var(--border); }
+
+    .flow-label { font-family: 'DM Mono', monospace; font-size: .65rem; letter-spacing: .12em; text-transform: uppercase; color: var(--accent2); margin-bottom: .4rem; }
+    .flow-title { font-size: .88rem; color: var(--heading); font-weight: 500; margin-bottom: .3rem; }
+    .flow-desc  { font-size: .78rem; color: var(--muted); line-height: 1.4; }
+
+    /* ── lesson box ── */
+    .lesson {
+      background: rgba(59,130,246,.06);
+      border: 1px solid rgba(59,130,246,.2);
+      border-radius: 6px;
+      padding: 1.4rem 1.6rem;
+      margin: 2rem 0;
+    }
+
+    .lesson-title {
+      font-family: 'DM Mono', monospace;
+      font-size: .68rem;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--accent2);
+      margin-bottom: .7rem;
+    }
+
+    /* ── tech stack table ── */
+    .stack-table { width: 100%; border-collapse: collapse; margin: 1.5rem 0 2rem; font-size: .9rem; }
+    .stack-table th {
+      text-align: left;
+      font-family: 'DM Mono', monospace;
+      font-size: .68rem;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      padding: .6rem 1rem .6rem 0;
+    }
+    .stack-table td { padding: .7rem 1rem .7rem 0; border-bottom: 1px solid rgba(30,42,56,.6); vertical-align: top; }
+    .stack-table td:first-child { font-family: 'DM Mono', monospace; color: var(--accent); white-space: nowrap; width: 180px; }
+
+    /* ── tags ── */
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      margin-top: 3rem;
+      padding-top: 2rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .tag {
+      font-family: 'DM Mono', monospace;
+      font-size: .7rem;
+      background: var(--tag-bg);
+      color: var(--tag-color);
+      padding: .25rem .6rem;
+      border-radius: 3px;
+      border: 1px solid rgba(77,168,212,.15);
+    }
+
+    /* ── github link ── */
+    .gh-link {
+      display: inline-flex;
+      align-items: center;
+      gap: .5rem;
+      font-family: 'DM Mono', monospace;
+      font-size: .8rem;
+      color: var(--heading);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: .6rem 1.2rem;
+      border-radius: 4px;
+      text-decoration: none;
+      margin: 1rem 0 2rem;
+      transition: border-color .2s, background .2s;
+    }
+    .gh-link:hover { border-color: rgba(0,212,170,.4); background: rgba(0,212,170,.05); color: var(--accent); }
+
+    /* ── article nav ── */
+    .article-nav {
+      display: flex;
+      justify-content: flex-start;
+      padding: 2rem 0 4rem;
+      border-top: 1px solid var(--border);
+      margin-top: 1rem;
+    }
+
+    .back-link {
+      font-family: 'DM Mono', monospace;
+      font-size: .78rem;
+      color: var(--muted);
+      text-decoration: none;
+      letter-spacing: .08em;
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      border: 1px solid var(--border);
+      padding: .55rem 1rem;
+      border-radius: 4px;
+      transition: all .2s;
+    }
+    .back-link:hover { color: var(--accent); border-color: rgba(0,212,170,.3); background: rgba(0,212,170,.05); }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2.5rem 2rem;
+      position: relative;
+      z-index: 1;
+    }
+
+    .footer-inner {
+      max-width: 780px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+
+    .footer-logo { font-family: 'DM Mono', monospace; font-size: .8rem; color: var(--accent); letter-spacing: .1em; }
+    .footer-note { font-size: .8rem; color: var(--muted); }
+    footer a { color: var(--accent2); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(18px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .reveal { opacity: 0; transform: translateY(16px); transition: opacity .55s ease, transform .55s ease; }
+    .reveal.visible { opacity: 1; transform: none; }
+
+    @media (max-width: 640px) {
+      .layer-grid { grid-template-columns: 1fr; }
+      .flow { flex-direction: column; }
+      .flow-step:not(:last-child)::after { content: '↓'; right: auto; left: 50%; top: auto; bottom: -14px; transform: translateX(-50%); }
+      .flow-step:not(:last-child) { border-right: none; border-bottom: 1px solid var(--border); }
+    }
+  </style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-back">← All Articles</a>
+    <a href="../index.html" class="nav-logo">// knowledge</a>
+  </div>
+</nav>
+
+<header>
+  <span class="eyebrow">AI Agents · Model Context Protocol</span>
+  <h1>Building a Production <em>Multi-Agent</em> System with MCP</h1>
+  <p class="subtitle">Orchestrator pattern, FastMCP, LLM-driven tool selection, and the lessons learned keeping agents on the rails.</p>
+  <div class="meta">
+    <span class="meta-item">🕐 15 min read</span>
+    <span class="meta-item">📅 2025</span>
+    <span class="meta-item">🏷 MCP · Agents · OpenAI · Python</span>
+  </div>
+</header>
+
+<div class="container">
+<article>
+
+  <p class="reveal">Artificial intelligence has moved well beyond chatbots that simply answer questions. The frontier today is <strong>agentic AI</strong> — systems that receive a goal, reason about what needs to be done, call external tools autonomously, and complete multi-step tasks without hand-holding.</p>
+
+  <p class="reveal">I recently built a production-grade multi-agent system from scratch using Model Context Protocol (MCP), FastMCP, and OpenAI's o4-mini reasoning model. This article walks through the full journey: what MCP is and why it matters, how the system is architected, the beauty of LLM-driven tool selection, a real cross-agent workflow, and the critical lessons I learned about keeping agents on the rails.</p>
+
+  <a class="gh-link reveal" href="https://github.com/asimansubera/mcp-agent" target="_blank" rel="noopener">
+    ⌥ github.com/asimansubera/mcp-agent ↗
+  </a>
+
+  <!-- ── 01 ── -->
+  <h2 class="reveal"><span class="num">01</span> What Is Model Context Protocol?</h2>
+
+  <p class="reveal">Before MCP, integrating an AI model with an external system required custom glue code for every combination of model and tool. Claude needed one connector for your database, another for Slack, another for your file system — and every other AI model needed the same connectors built separately. It was an <strong>N×M integration problem</strong> that did not scale.</p>
+
+  <p class="reveal">Model Context Protocol is an open standard introduced by Anthropic in November 2024 and now adopted by OpenAI, Google DeepMind, and Microsoft. Think of it as <strong>USB-C for AI</strong> — a single universal connector between language models and the outside world.</p>
+
+  <div class="callout reveal">
+    The protocol defines a client-server architecture built on JSON-RPC 2.0. An MCP server exposes <strong>tools</strong> (functions the AI can call), <strong>resources</strong> (data it can read), and <strong>prompts</strong> (templates). An MCP client connects to one or more servers, discovers what is available, and routes the model's requests to the right place. Communication happens over <code>stdio</code> for local servers or Streamable HTTP for remote ones.
+  </div>
+
+  <p class="reveal">The elegant result: build one MCP server for your database, and every MCP-compatible AI client — Claude, your custom agent, Cursor, GitHub Copilot — can use it immediately.</p>
+
+  <!-- ── 02 ── -->
+  <h2 class="reveal"><span class="num">02</span> The Orchestrator Pattern</h2>
+
+  <p class="reveal">For this project I chose the <strong>orchestrator pattern</strong> — the most scalable approach for multi-agent systems. Rather than building one large agent that knows everything, the system is divided into three distinct layers:</p>
+
+  <div class="arch-box reveal"><span style="color:var(--muted)">User types a task</span>
         |
         v
-  Orchestrator  (OpenAI o4-mini)
+  <span style="color:var(--accent2)">Orchestrator</span>  (OpenAI o4-mini)
   ├── decides which specialist(s) to delegate to
-  ├── calls delegate_to_agent(agent_name, sub_task)
+  ├── calls <span style="color:var(--accent)">delegate_to_agent</span>(agent_name, sub_task)
   |
-  |---> LocalAgent ---------> server/server.py  (FastMCP, stdio)
+  |---> <span style="color:var(--accent)">LocalAgent</span> ---------> server/server.py  (FastMCP, stdio)
   |          9 tools: files, directories, SQLite database
   |
-  └---> OpenMeteoAgent -----> npx open-meteo-mcp-server  (stdio, no API key)
-             6 tools: weather forecast, archive, air quality, marine, elevation, geocoding
+  └---> <span style="color:#f59e0b)">OpenMeteoAgent</span> ---> npx open-meteo-mcp-server  (stdio)
+             6 tools: forecast, archive, air quality, marine, elevation, geocoding</div>
 
-The orchestrator receives the user's plain-English task. It has exactly one tool: delegate_to_agent(agent_name, sub_task). It never touches files, databases, or weather APIs directly. Its only job is to reason about the task, decide which specialist is responsible, and delegate with a clear sub-task string that contains all the context the specialist needs.
+  <div class="layer-grid reveal">
+    <div class="layer-card orch">
+      <div class="layer-label">Layer 1</div>
+      <div class="layer-title">Orchestrator</div>
+      <div class="layer-desc">Receives the user goal. Reasons and delegates — never touches tools directly.</div>
+      <div class="layer-tools">1 tool: delegate_to_agent()</div>
+    </div>
+    <div class="layer-card local">
+      <div class="layer-label">Layer 2a</div>
+      <div class="layer-title">LocalAgent</div>
+      <div class="layer-desc">Filesystem and SQLite expert. Connects to a local FastMCP server via stdio.</div>
+      <div class="layer-tools">9 tools: files, dirs, db_read/write</div>
+    </div>
+    <div class="layer-card wx">
+      <div class="layer-label">Layer 2b</div>
+      <div class="layer-title">OpenMeteoAgent</div>
+      <div class="layer-desc">Weather and geocoding expert. Connects to an npm MCP server via npx.</div>
+      <div class="layer-tools">6 tools: forecast, archive, air quality…</div>
+    </div>
+  </div>
 
-The LocalAgent is a specialist that connects to a local FastMCP server written in Python. This server exposes 9 tools covering all filesystem and database operations.
+  <p class="reveal">The orchestrator has exactly one tool: <code>delegate_to_agent(agent_name, sub_task)</code>. It never touches files, databases, or weather APIs directly. Its only job is to reason about the task, decide which specialist is responsible, and delegate with a clear sub-task string containing all the context the specialist needs.</p>
 
-The OpenMeteoAgent is a specialist that connects to open-meteo-mcp-server — an npm package that runs via npx with zero credentials. It wraps Open-Meteo's free public weather API, exposing 6 tools for forecasts, historical weather, air quality, marine conditions, elevation, and geocoding.
+  <!-- ── 03 ── -->
+  <h2 class="reveal"><span class="num">03</span> Building the Local MCP Server with FastMCP</h2>
 
-This separation of concerns is intentional and fundamental. Each agent is a domain expert. It knows its tools deeply and is instructed to use only those tools. The orchestrator is a coordinator — it knows which expert to call but does not do any domain work itself.
+  <p class="reveal">The local server is built using <strong>FastMCP</strong> — the high-level server framework that ships inside the official MCP Python SDK. Its key advantage is that it eliminates boilerplate entirely. Instead of manually writing JSON schemas, routing logic, and transport handling, you decorate Python functions:</p>
 
+<pre class="reveal"><span class="kw">from</span> mcp.server.fastmcp <span class="kw">import</span> FastMCP
 
-Building the Local MCP Server with FastMCP
-The local server is built using FastMCP — the high-level server framework that ships inside the official MCP Python SDK. Its key advantage is that it eliminates boilerplate entirely. Instead of manually writing JSON schemas, routing logic, and transport handling, you simply decorate Python functions:
+mcp = <span class="fn">FastMCP</span>(<span class="st">"local-fs-db-server"</span>)
 
-from mcp.server.fastmcp import FastMCP
-
-mcp = FastMCP("local-fs-db-server")
-
-@mcp.tool()
-def db_write(key: str, value: str) -> str:
-    """Insert or update a key-value note in the SQLite database.
+<span class="dc">@mcp.tool()</span>
+<span class="kw">def</span> <span class="fn">db_write</span>(key: str, value: str) -> str:
+    <span class="st">"""Insert or update a key-value note in the SQLite database.
     Uses UPSERT — if the key exists, its value is updated, not duplicated.
 
     Args:
         key:   Unique note key / label
         value: Note value / content
-    """
-    # implementation
-    ...
+    """</span>
+    <span class="cm"># implementation</span>
+    ...</pre>
 
-FastMCP reads the function signature, generates the JSON schema from type hints, and uses the docstring as the tool description that the LLM reads when deciding what to call. The description is not just documentation — it is the primary signal the model uses to select the right tool. This is a critical design point I will return to shortly.
+  <p class="reveal">FastMCP reads the function signature, generates the JSON schema from type hints, and uses the docstring as the tool description that the LLM reads when deciding what to call. <strong>The description is not just documentation — it is the primary signal the model uses to select the right tool.</strong></p>
 
-The server exposes 9 idempotent tools. Every tool is safe to call multiple times. db_write uses INSERT ... ON CONFLICT(key) DO UPDATE so running the agent repeatedly never creates duplicate rows. Directories use exist_ok=True. Files always overwrite. This idempotency is deliberate — agents will retry, and the system must be resilient to that.
+  <div class="callout green reveal">
+    Every one of the 9 tools is <strong>idempotent</strong>. <code>db_write</code> uses <code>INSERT ... ON CONFLICT(key) DO UPDATE</code> so running the agent repeatedly never creates duplicate rows. Directories use <code>exist_ok=True</code>. Files always overwrite. Agents will retry — the system must be resilient to that.
+  </div>
 
-The server runs as a subprocess of the agent. When the agent starts, it spawns server.py via StdioServerParameters, communicates over stdin/stdout using JSON-RPC 2.0, and kills the subprocess when done. The server is never run manually.
+  <!-- ── 04 ── -->
+  <h2 class="reveal"><span class="num">04</span> The OpenMeteo Agent: Zero Credentials</h2>
 
+  <p class="reveal">The OpenMeteoAgent connects to an external, community-built MCP server that requires no API key, no account, and no installation beyond Node.js. It runs entirely via:</p>
 
-The OpenMeteo Agent: External MCP with Zero Credentials
-The OpenMeteoAgent connects to an external, community-built MCP server that requires no API key, no account, and no installation beyond Node.js. It runs entirely via:
+<pre class="reveal"><span class="fn">StdioServerParameters</span>(
+    command=<span class="st">"npx"</span>,
+    args=[<span class="st">"-y"</span>, <span class="st">"open-meteo-mcp-server"</span>],
+)</pre>
 
-StdioServerParameters(
-    command="npx",
-    args=["-y", "open-meteo-mcp-server"],
-)
+  <p class="reveal">This is what the MCP ecosystem looks like in practice. A community developer packaged Open-Meteo's comprehensive weather API as an MCP server, published it to npm, and anyone can connect to it with three lines of configuration. The agent discovers the available tools at runtime by calling <code>session.list_tools()</code> — it does not need to know anything about the server implementation in advance.</p>
 
-This is what the MCP ecosystem looks like in practice. A community developer has packaged Open-Meteo's comprehensive weather API as an MCP server, published it to npm, and anyone can connect to it with three lines of configuration. The agent discovers the available tools at runtime by calling session.list_tools() — it does not need to know anything about the server implementation in advance.
+  <!-- ── 05 ── -->
+  <h2 class="reveal"><span class="num">05</span> LLM-Driven Natural Language Tool Selection</h2>
 
-The six tools cover a wide surface: weather_forecast for 7-day hourly and daily forecasts, weather_archive for historical data going back to 1940, air_quality for PM2.5, PM10, UV index, and pollen levels, marine_weather for wave conditions, elevation for altitude data, and geocoding for converting city names to coordinates.
+  <p class="reveal">This is where the system becomes genuinely remarkable. <strong>No part of the code decides which tool to call.</strong> No <code>if task contains "weather" then use openmeteo</code>. The entire tool selection process is driven by the language model's natural language understanding.</p>
 
+  <div class="flow reveal">
+    <div class="flow-step">
+      <div class="flow-label">Step 1</div>
+      <div class="flow-title">Task Arrives</div>
+      <div class="flow-desc">User types a plain-English goal. Orchestrator receives it.</div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-label">Step 2</div>
+      <div class="flow-title">o4-mini Reasons</div>
+      <div class="flow-desc">Model reads task + agent descriptions, decides which specialist owns it.</div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-label">Step 3</div>
+      <div class="flow-title">Delegate</div>
+      <div class="flow-desc">Orchestrator calls delegate_to_agent() with a precise sub-task string.</div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-label">Step 4</div>
+      <div class="flow-title">Tool Selection</div>
+      <div class="flow-desc">Specialist LLM reads MCP tool list, picks tools, chains calls, returns result.</div>
+    </div>
+  </div>
 
-The Beauty of LLM-Driven Natural Language Tool Selection
-This is where the system becomes genuinely remarkable.
+  <p class="reveal">The LLM infers multi-step plans entirely from tool descriptions. Given the sub-task "get coordinates for Mumbai then fetch a 3-day weather forecast", the model recognises that geocoding must be called first to get latitude and longitude, then those coordinates must be passed to <code>weather_forecast</code>. Nobody wrote this logic. It emerges from the model's understanding of the tool descriptions and the natural dependencies between them.</p>
 
-No part of the code decides which tool to call. No if task contains "weather" then use openmeteo. The entire tool selection process is driven by the language model's natural language understanding.
+  <!-- ── 06 ── -->
+  <h2 class="reveal"><span class="num">06</span> A Real Cross-Agent Workflow</h2>
 
-Here is exactly how it works:
+  <p class="reveal">Let me walk through a concrete end-to-end example that shows both agents working together.</p>
 
-When the orchestrator receives a task, it sends the task text along with a description of each available agent to o4-mini. The model reads them, reasons about what the task requires, and responds with a structured delegate_to_agent call specifying which agent and what sub-task to give it.
+  <div class="callout reveal">
+    <strong>User input:</strong> "Get the 3-day weather forecast for Mumbai and save each day to the local database"
+  </div>
 
-Inside the specialist agent, the same process repeats at the tool level. The agent sends the task it received along with the full list of MCP tools — names, descriptions, and parameter schemas — to the LLM. The model decides which tool to call, what arguments to pass, and whether to call more tools or return a final answer.
+  <p class="reveal"><strong>Orchestrator step 1</strong> — Recognises this spans two domains: weather retrieval and local storage. Delegates to OpenMeteoAgent first with a precise sub-task. The agent calls <code>geocoding(name="Mumbai")</code> to get coordinates, then <code>weather_forecast</code> with those coordinates. It returns three days of structured weather data.</p>
 
-The LLM infers multi-step plans entirely from tool descriptions. Given the sub-task "get coordinates for Mumbai then fetch a 3-day weather forecast", the model recognises that geocoding must be called first to get latitude and longitude, then those coordinates must be passed to weather_forecast. Nobody wrote this logic. It emerges from the model's understanding of the tool descriptions and the natural dependencies between them.
+  <p class="reveal"><strong>Orchestrator step 2</strong> — Receives the weather data and delegates to LocalAgent, passing the actual data inline in the sub-task string. The LocalAgent calls <code>db_write</code> three times with unique date-based keys — each using UPSERT, so re-running tomorrow updates rather than duplicates.</p>
 
+  <p class="reveal"><strong>Result:</strong> Three rows live in a local SQLite database. No Python scripts. No SQL written by hand. No shell commands. The LLM understood the intent, selected the right tools in the right sequence, and coordinated data transfer between two completely separate agents — all from a single sentence of plain English.</p>
 
-A Real Cross-Agent Workflow: Weather Data to Local Database
-Let me walk through a concrete end-to-end example that shows both agents working together.
+  <!-- ── 07 ── -->
+  <h2 class="reveal"><span class="num">07</span> The Critical Lesson: System Prompts as Control</h2>
 
-User input: "Get the 3-day weather forecast for Mumbai and save each day to the local database"
+  <p class="reveal">During development I encountered a fundamental failure mode. When the LocalAgent was asked to "save weather data to the database", it occasionally responded by generating a Python script using <code>sqlite3</code> directly, then suggesting the user run it manually. The LLM defaulted to what it knows best — writing code — rather than using the MCP tools it had been given.</p>
 
-Orchestrator step 1 — The orchestrator recognises this spans two domains: weather retrieval and local storage. It delegates to OpenMeteoAgent first:
+  <p class="reveal"><strong>The fix was not in the code. It was in the system prompts.</strong></p>
 
-Sub-task: "Get coordinates for Mumbai then fetch a 3-day weather forecast with daily temperature highs and lows, precipitation, and humidity."
+  <div class="lesson reveal">
+    <div class="lesson-title">⚑ Key architectural lesson</div>
+    <p style="margin:0; font-size:.95rem;">Positive guidance alone is not enough. You need explicit prohibitions against the failure modes you have observed. Vague prompts produce creative but wrong behaviour. Precise, specific, prohibitive prompts produce reliable, predictable tool use. The system prompt is your primary control mechanism.</p>
+  </div>
 
-The OpenMeteoAgent calls geocoding(name="Mumbai") to get the coordinates, then calls weather_forecast with those coordinates and the appropriate parameters. It returns a structured summary of three days of weather data.
+  <p class="reveal">I added explicit prohibitive rules to both the agent and orchestrator prompts — for example, the LocalAgent prompt states: <em>"You ONLY use the tools listed above. You never write Python scripts, shell commands, SQL statements, or any code as your response."</em></p>
 
-Orchestrator step 2 — The orchestrator receives the weather data and delegates to LocalAgent, passing the actual data inline:
+  <p class="reveal">The same principle applies to tool descriptions on the server side. A vague description like <em>"saves data"</em> will cause the model to misuse the tool or skip it. A specific description like <em>"Insert or update a key-value note using UPSERT — safe to call multiple times"</em> gives the model exactly what it needs to make the right decision.</p>
 
-Sub-task: "Save these 3 forecast records to the database: day1 key='mumbai_2026-04-06' value='max 34°C min 27°C humidity 72% precipitation 2mm', day2 key='mumbai_2026-04-07' value='max 33°C min 26°C humidity 75% precipitation 5mm', day3 key='mumbai_2026-04-08' value='max 32°C min 26°C humidity 78% precipitation 8mm'"
+  <!-- ── 08 ── -->
+  <h2 class="reveal"><span class="num">08</span> Tech Stack</h2>
 
-The LocalAgent calls db_write three times with unique date-based keys. Each call uses UPSERT — running this query again tomorrow will update the records, not duplicate them.
+  <table class="stack-table reveal">
+    <thead>
+      <tr><th>Component</th><th>Role</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>Python 3.12</code></td><td>Core language</td></tr>
+      <tr><td><code>mcp &gt;= 1.0.0</code></td><td>Official Anthropic MCP Python SDK</td></tr>
+      <tr><td><code>FastMCP</code></td><td>High-level <code>@mcp.tool()</code> decorator framework, ships inside mcp</td></tr>
+      <tr><td><code>OpenAI SDK</code></td><td>Typed tool params, full type safety across orchestrator and agents</td></tr>
+      <tr><td><code>o4-mini</code></td><td>Reasoning model for orchestrator and all specialist agents</td></tr>
+      <tr><td><code>open-meteo-mcp-server</code></td><td>npm package, runs via npx, zero credentials required</td></tr>
+      <tr><td><code>SQLite</code></td><td>Built into Python stdlib, no external database server</td></tr>
+      <tr><td><code>Docker + compose</code></td><td>Containerised deployment</td></tr>
+    </tbody>
+  </table>
 
-Result: Three rows now live in a local SQLite database. Later, the user can ask "read the Mumbai forecast from the database" — LocalAgent calls db_read, retrieves all three rows, and presents them in a readable format.
+  <!-- ── 09 ── -->
+  <h2 class="reveal"><span class="num">09</span> Extensibility: Adding a New Agent in Two Steps</h2>
 
-No Python scripts. No SQL written by hand. No shell commands. The LLM understood the intent, selected the right tools in the right sequence, and coordinated data transfer between two completely separate agents — all from a single sentence of plain English.
+  <p class="reveal">The architecture is designed to grow. Adding a third specialist — a GitHub agent, a Slack agent, a PostgreSQL agent — requires exactly two changes:</p>
 
+  <p class="reveal"><strong>Step 1:</strong> Create <code>agents/github_agent.py</code> extending <code>BaseAgent</code>, set <code>server_params</code> to point at the MCP server package.</p>
 
-A Critical Lesson: Tool-Only Enforcement Through System Prompts
-During development I encountered a fundamental failure mode that taught me the most important lesson of this project.
+  <p class="reveal"><strong>Step 2:</strong> Register it in <code>orchestrator.py</code> with a one-line description.</p>
 
-When the LocalAgent was asked to "save weather data to the database", it occasionally responded by generating a Python script using sqlite3 directly, then suggesting the user run it manually. The LLM defaulted to what it knows best — writing code — rather than using the MCP tools it had been given.
+  <p class="reveal">The orchestrator automatically includes the new agent in the LLM's decision context. No changes to existing agents. No changes to <code>BaseAgent</code>. No changes to session management. The system self-extends.</p>
 
-The fix was not in the code. It was in the system prompts.
+  <div class="callout reveal">
+    The growing ecosystem of community-built MCP servers — covering GitHub, Slack, Notion, Jira, PostgreSQL, Stripe, and hundreds more — becomes a library of plug-and-play capabilities any agent can connect to with a few lines of configuration.
+  </div>
 
-I added explicit, prohibitive rules to both the agent and orchestrator prompts:
+  <!-- ── closing ── -->
+  <h2 class="reveal"><span class="num">10</span> Conclusion</h2>
 
-For the LocalAgent:
+  <p class="reveal">Building this system reinforced something I believe deeply: the hard part of multi-agent AI is not the code. The hard part is the <strong>design of responsibilities</strong>, the <strong>clarity of tool descriptions</strong>, and the <strong>precision of system prompts</strong>.</p>
 
-"You ONLY use the tools listed above. You never write Python scripts, shell commands, SQL statements, or any code as your response. You NEVER suggest the user run a script or command. You execute actions directly."
+  <p class="reveal">Get those right and the LLM does exactly what you intend — selecting the right tools in the right sequence, coordinating across agents, and handling complex multi-step tasks from plain English with no hardcoded logic anywhere in the pipeline. Get them wrong and you will spend your time chasing hallucinated scripts and misrouted delegations.</p>
 
-For the orchestrator:
+  <a class="gh-link reveal" href="https://github.com/asimansubera/mcp-agent" target="_blank" rel="noopener">
+    ⌥ View source on GitHub — github.com/asimansubera/mcp-agent ↗
+  </a>
 
-"Agents ONLY execute actions using their MCP tools. They do NOT write scripts or code. When you delegate to the local agent to save data, say 'save this to the database' and pass the actual data. Do NOT ask it to 'create a script'."
+  <div class="tags reveal">
+    <span class="tag">#ModelContextProtocol</span>
+    <span class="tag">#MCP</span>
+    <span class="tag">#AIAgents</span>
+    <span class="tag">#MultiAgent</span>
+    <span class="tag">#FastMCP</span>
+    <span class="tag">#OpenAI</span>
+    <span class="tag">#Python</span>
+    <span class="tag">#SoftwareArchitecture</span>
+    <span class="tag">#GenerativeAI</span>
+    <span class="tag">#LLM</span>
+    <span class="tag">#BuildInPublic</span>
+  </div>
 
-This is the most important architectural lesson: the system prompt is your primary control mechanism. Positive guidance alone is not enough. You need explicit prohibitions against the failure modes you have observed. Vague prompts produce creative but wrong behaviour. Precise, specific, prohibitive prompts produce reliable, predictable tool use.
+  <div class="article-nav reveal">
+    <a href="../index.html" class="back-link">← Back to all articles</a>
+  </div>
 
-The same principle applies to tool descriptions on the server side. The LLM selects tools based entirely on their names and descriptions. A vague description like "saves data" will cause the model to misuse the tool or skip it. A specific description like "Insert or update a key-value note using UPSERT — safe to call multiple times" gives the model exactly what it needs to make the right decision.
+</article>
+</div>
 
+<footer>
+  <div class="footer-inner">
+    <span class="footer-logo">// mcp-agent</span>
+    <span class="footer-note">Originally published on <a href="https://www.linkedin.com/in/asimansubera/" target="_blank" rel="noopener">LinkedIn</a></span>
+  </div>
+</footer>
 
-The Tech Stack
-Python 3.12 — core language
-
-mcp >= 1.0.0 — official Anthropic MCP Python SDK
-
-FastMCP — high-level @mcp.tool() decorator framework, ships inside mcp
-
-OpenAI SDK — typed ChatCompletionToolParam, ChatCompletionMessageToolCall, full type safety
-
-OpenAI o4-mini — reasoning model for orchestrator and all specialist agents
-
-open-meteo-mcp-server — npm package, runs via npx, no credentials required
-
-SQLite — built into Python stdlib, no external database server
-
-Docker + docker-compose — containerised deployment
-
-The MCP client uses the low-level SDK (ClientSession + StdioServerParameters) rather than a high-level wrapper, which provides full type safety, clean error handling, and precise control over the session lifecycle.
-
-
-Extensibility: Adding a New Agent in Two Steps
-The architecture is designed to grow. Adding a third specialist — a GitHub agent, a Slack agent, a database agent for PostgreSQL — requires exactly two changes:
-
-Step 1: Create agents/github_agent.py extending BaseAgent, set server_params to point at the MCP server package.
-
-Step 2: Register it in orchestrator.py with a one-line description.
-
-The orchestrator automatically includes the new agent in the LLM's decision context. No changes to existing agents. No changes to BaseAgent. No changes to the session management. The system self-extends.
-
-This is the promise of MCP at scale. The growing ecosystem of community-built MCP servers — covering GitHub, Slack, Notion, Jira, PostgreSQL, Stripe, and hundreds more — becomes a library of plug-and-play capabilities any agent can connect to with a few lines of configuration.
-
-
-Conclusion
-Building this system reinforced something I believe deeply: the hard part of multi-agent AI is not the code. The hard part is the design of responsibilities, the clarity of tool descriptions, and the precision of system prompts.
-
-Get those right and the LLM does exactly what you intend — selecting the right tools in the right sequence, coordinating across agents, and handling complex multi-step tasks from plain English input with no hardcoded logic anywhere in the pipeline.
-
-Get them wrong and you will spend your time chasing hallucinated scripts and misrouted delegations.
-
-The source code is available on GitHub at github.com/asimansubera/mcp-agent. I am happy to discuss the architecture, design decisions, or lessons learned in the comments.
-
-
-Tags: #ModelContextProtocol #MCP #AIAgents #MultiAgent #FastMCP #OpenAI #Python #SoftwareArchitecture #GenerativeAI #LLM #ArtificialIntelligence #BuildInPublic
+<script>
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('visible'); observer.unobserve(e.target); } });
+  }, { threshold: 0.08 });
+  document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+</script>
+</body>
+</html>
